@@ -20,7 +20,9 @@ That said, provided in this project is a binary, **tumblrctl**.
 
 3. If you are running tumblrctl from a VM or container, use [SSHFS](https://github.com/libfuse/sshfs) (or whatever host-guest mount you wish) to mount your host's (or any remote's) Reeder database directory to tumblrctl's `rkit-sshfs-mountpoint` directory. For example:
 
-   sshfs myhost:"/Users/you/Library/Containers/com.reederapp.rkit2.mac/Data/Library/Application Support/Reeder/rkit" /home/you/tumblrctl/rkit-sshfs-mountpoint -o 'sshfs_sync,cache=no'
+```bash
+sshfs myhost:"/Users/you/Library/Containers/com.reederapp.rkit2.mac/Data/Library/Application Support/Reeder/rkit" /home/you/tumblrctl/rkit-sshfs-mountpoint -o 'sshfs_sync,cache=no'
+```
 
 ## Low-level functionality
 
