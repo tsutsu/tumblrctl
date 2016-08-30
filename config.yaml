@@ -1,8 +1,8 @@
 ---
-reeder:
+:reeder:
   :account: 'you@example.com'
 
-tumblr:
+:tumblr:
   :reblog_blog: 'someblogname'
   :oauth:
     :consumer_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'

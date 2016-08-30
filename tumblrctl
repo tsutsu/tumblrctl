@@ -65,7 +65,7 @@ $tumblr_db.execute 'CREATE UNIQUE INDEX IF NOT EXISTS sets_posts_map ON sets_pos
 
 $tumblr_db = SynchronizedDatabaseAccessProxy.new($tumblr_db)
 
-$tumblr_client = Tumblr::Client.new($config[:oauth])
+$tumblr_client = Tumblr::Client.new($config[:tumblr][:oauth])
 
 module Reeder; end
 class Reeder::User
