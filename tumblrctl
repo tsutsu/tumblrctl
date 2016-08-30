@@ -36,6 +36,11 @@ class SynchronizedDatabaseAccessProxy < ::BasicObject
   end
 end
 
+unless File.file? 'config.yaml'
+  $stderr.puts Paint["no config.yaml present; aborting", :red]
+  Kernel.exit 1
+end
+
 $config = YAML.load(File.open('config.yaml'))
 
 rkit_paths = [
