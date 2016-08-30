@@ -1,0 +1,17 @@
+---
+reeder:
+  :account: 'you@example.com'
+
+tumblr:
+  :reblog_blog: 'someblogname'
+  :oauth:
+    :consumer_key: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA'
+    :consumer_secret: 'SSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSSS'
+    :oauth_token: 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+    :oauth_token_secret: 'ssssssssssssssssssssssssssssssssssssssssssssssssss'
+
+:trash_filters: []
+#  - :blog: ionlyliketheimages.tumblr.com
+#    :type: :text
+#  - :blog: fluff-and-good-stuff.tumblr.com
+#    :tag: fluff

@@ -1,0 +1,15 @@
+#!/bin/bash
+
+while :; do
+#  if sshfs umbreon:"/Users/tsu/Library/Containers/com.reederapp.rkit2.mac/Data/Library/Application Support/Reeder/rkit" ./umbreon-rkit -o 'sshfs_sync,cache=no'; then
+#    ./tumblrctl sync
+#    fusermount -u ./umbreon-rkit
+#  fi
+
+  ./tumblrctl publish-random-draft
+
+  sleep_time=0
+  for i in 0 1 2 3 4 5; do sleep_time=$[$sleep_time + ($RANDOM % 300)]; done
+  echo "sleeping for ${sleep_time}s"
+  sleep "${sleep_time}s"
+done

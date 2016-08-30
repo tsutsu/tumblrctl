@@ -1,0 +1,1081 @@
+#!/usr/bin/env ruby
+
+require 'sqlite3'
+require 'thread'
+require 'pathname'
+require 'tumblr_client'
+require 'pp'
+require 'set'
+require 'json'
+require 'yaml'
+require 'digest'
+require 'uri'
+require 'stringio'
+require 'paint'
+require 'date'
+
+module Tumblr
+  module Blog
+    def draft(blog_name, options = {})
+      validate_options([:filter, :before_id], options)
+      get(blog_path(blog_name, 'posts/draft'), options)
+    end
+  end
+end
+
+class SynchronizedDatabaseAccessProxy < ::BasicObject
+  def initialize(db)
+    @db = db
+    @lock = ::Mutex.new
+  end
+
+  def method_missing(m, *args, &block)
+    @lock.synchronize do
+      @db.send(m, *args, &block)
+    end
+  end
+end
+
+$config = YAML.load(File.open('config.yaml'))
+
+rkit_paths = [
+  Pathname.new(Dir.pwd) + 'rkit-sshfs-mountpoint',
+  Pathname.new(ENV['HOME']) + 'Library' + 'Containers' + 'com.reederapp.rkit2.mac' + 'Data' + 'Library' + 'Application Support' + 'Reeder' + 'rkit'
+]
+
+if rkit_path = rkit_paths.find{ |p| (p + 'rkit.db').file? }
+  $rkit_db = SQLite3::Database.new((rkit_path + 'rkit.db').to_s)
+  $rkit_db.execute('ATTACH DATABASE ? AS data;', (rkit_path + 'rkit-data.db').to_s)
+  $rkit_db.execute('ATTACH DATABASE ? AS edit;', (rkit_path + 'rkit-edit.db').to_s)
+  $rkit_db.results_as_hash = true
+  $rkit_db = SynchronizedDatabaseAccessProxy.new($rkit_db)
+end
+
+
+$tumblr_db = SQLite3::Database.new 'tumblr.db'
+$tumblr_db.results_as_hash = true
+$tumblr_db.execute 'CREATE TABLE IF NOT EXISTS blogs ( "id" INTEGER PRIMARY KEY AUTOINCREMENT, "owned" INTEGER DEFAULT 0, "updated" INTEGER, "total_posts" INTEGER );'
+$tumblr_db.execute 'CREATE TABLE IF NOT EXISTS blog_aliases ( "alias" TEXT UNIQUE, "blog_id" INTEGER );'
+$tumblr_db.execute 'CREATE TABLE IF NOT EXISTS posts ( "aaid" INTEGER PRIMARY KEY AUTOINCREMENT, "id" INTEGER UNIQUE, "blog_id" INTEGER, "created" INTEGER, "discovered" TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL, "source_url" TEXT, "source_status" INTEGER DEFAULT 0, "source_id" INTEGER, "reblog_key" TEXT, "content_hash" TEXT, is_draft INTEGER DEFAULT 0, added_comment INTEGER DEFAULT 0, rkitem_id INTEGER, tags TEXT );'
+$tumblr_db.execute 'CREATE VIRTUAL TABLE IF NOT EXISTS post_tokens USING fts4( "post_id" INTEGER PRIMARY KEY ASC, "tokens" TEXT );'
+$tumblr_db.execute 'CREATE TABLE IF NOT EXISTS sets ( "id" INTEGER PRIMARY KEY AUTOINCREMENT, "name" TEXT UNIQUE );'
+$tumblr_db.execute 'CREATE TABLE IF NOT EXISTS sets_posts ( "set_id" INTEGER, "post_id" INTEGER );'
+$tumblr_db.execute 'CREATE INDEX IF NOT EXISTS posts_blogs ON posts (blog_id);'
+$tumblr_db.execute 'CREATE UNIQUE INDEX IF NOT EXISTS sets_posts_map ON sets_posts (set_id, post_id);'
+
+$tumblr_db = SynchronizedDatabaseAccessProxy.new($tumblr_db)
+
+$tumblr_client = Tumblr::Client.new($config[:oauth])
+
+module Reeder; end
+class Reeder::User
+  def self.by_username(username)
+    id = $rkit_db.get_first_value('SELECT id FROM rkuser WHERE username = ? LIMIT 1;', username)
+    self.new(id)
+  end
+
+  def initialize(id)
+    @row = $rkit_db.get_first_row('SELECT * FROM rkuser WHERE id = ? LIMIT 1;', id).delete_if{ |k,v| k.class == Fixnum }.map{ |(k,v)| [k.intern, v] }.to_h
+  end
+
+  def starred_items
+    $rkit_db.execute('SELECT id FROM rkitem WHERE rkitem.userid = ? AND rkitem.starred = 1;', @row[:id]).map{ |r| Reeder::Item.new(r['id']) }
+  end
+
+  def streams
+    $rkit_db.execute('SELECT id FROM rkstream WHERE user = ?;', @row[:id]).map{ |r| Reeder::Stream.new(r['id']) }
+  end
+
+  def feeds
+    self.streams.find_all{ |s| s.leaf? }
+  end
+end
+
+class Reeder::Stream
+  def initialize(id)
+    @row = $rkit_db.get_first_row('SELECT * FROM rkstream WHERE id = ?;', id).delete_if{ |k,v| k.class == Fixnum }.map{ |(k,v)| [k.intern, v] }.to_h
+  end
+
+  def items
+    $rkit_db.execute('SELECT id FROM rkitem WHERE rkitem.stream = ?;', @row[:id]).map{ |r| Reeder::Item.new(r[0]) }
+  end
+
+  def children
+    (@row[:streams].split('/') - ['']).map{ |stream_id| Reeder::Stream.new(stream_id.to_i) }
+  end
+
+  def parents
+    (@row[:folders].split('/') - ['']).map{ |stream_id| Reeder::Stream.new(stream_id.to_i) }
+  end
+
+  def folder?
+    @row[:isFolder] == 1
+  end
+
+  def leaf?
+    not(self.folder?)
+  end
+
+  def empty?
+    raise ArgumentError unless self.leaf?
+    @row[:itemCount] == 0
+  end
+
+  def website
+    URI.parse(@row[:link].encode(Encoding::US_ASCII, invalid: :replace, undef: :replace, replace: '-'))
+  end
+
+  def name
+    @row[:title]
+  end
+end
+
+class Reeder::Item
+  def self.search(text)
+    $rkit_db.execute('SELECT rkitem.id FROM rkitem JOIN rkitemdata ON rkitem.id = rkitemdata.item WHERE rkitemdata.content LIKE ?;', "%#{text}%").map{ |r| self.new(r[0]) }
+  end
+
+  def initialize(id)
+    @row = $rkit_db.get_first_row('SELECT * FROM rkitem WHERE rkitem.id = ?;', id).delete_if{ |k,v| k.class == Fixnum }.map{ |(k,v)| [k.intern, v] }.to_h
+    if data_row = $rkit_db.get_first_row('SELECT * FROM rkitemdata WHERE rkitemdata.item = ?;', @row[:id])
+      data_row = data_row.delete_if{ |k,v| k.class == Fixnum }.map{ |(k,v)| [k.intern, v] }.to_h
+      @row = data_row.merge(@row)
+    end
+  end
+
+  def stream
+    Reeder::Stream.new(@row[:stream])
+  end
+
+  def id
+    @row[:id]
+  end
+
+  def source_uri
+    unless @row[:link]
+      p @row
+      #$rkit_db.execute 'DELETE FROM rkitem WHERE id = ?;', @row[:id]
+      raise ArgumentError, "Reeder::Item invalidated: #{@row[:id]}"
+    end
+
+    @uri ||= URI.parse(@row[:link].encode(Encoding::US_ASCII, invalid: :replace, undef: :replace, replace: '-'))
+  end
+
+  def tumblr_post?
+    uri = self.source_uri
+    path_parts = uri.path[1..-1].split('/')
+    path_parts.length >= 2 && path_parts[0] == 'post' && path_parts[1] =~ /^\d+$/
+  end
+
+  def tumblr_post_uri
+    return nil unless self.tumblr_post?
+    self.source_uri
+  end
+
+  def tumblr_post_parts
+    tumblr_uri = self.tumblr_post_uri
+    return nil unless tumblr_uri
+    {blog: tumblr_uri.hostname, post_id: tumblr_uri.path[1..-1].split('/')[1].to_i}
+  end
+
+  def tumblr_post
+    return nil unless tumblr_uri = self.tumblr_post_uri
+
+    begin
+      Tumblr2::Post.by_url(tumblr_uri)
+    rescue Tumblr2::BlogDeleted
+      nil
+    rescue Tumblr2::PostDeleted
+      nil
+    end
+  end
+
+  def content
+    @row[:content]
+  end
+
+  def media?
+    self.content =~ /<(img|video|audio|iframe)/
+  end
+
+  def text?
+    not(self.media?)
+  end
+
+  def type
+    self.media? ? :media : :text
+  end
+
+  def unread
+    @row[:unread] == 1
+  end
+
+  alias_method :unread?, :unread
+
+  def unread=(bool)
+    edit_action = bool ? 'keepUnread' : 'markAsRead'
+    old_unread_state = self.unread? ? 1 : 2
+    new_unread_state = bool ? 1 : 2
+    unread_delta = -(new_unread_state - old_unread_state)
+
+    $rkit_db.transaction do |db|
+      if r = db.get_first_row('SELECT id, json FROM rkedit WHERE user = ? AND json LIKE ?;', @row[:userid], "%#{edit_action}%")
+        pending_edit = JSON.parse(r['json'])
+        pending_edit['entryIds'] |= [@row[:oid]]
+        db.execute 'UPDATE rkedit SET json = ? WHERE id = ?;', pending_edit.to_json, r['id']
+      else
+        new_edit = {
+          'entryIds' => [@row[:oid]],
+          'a' => 'readStateMarkerWithDictionary:',
+          'action' => edit_action
+        }
+        db.execute 'INSERT INTO rkedit (user, json) VALUES (?,?);', @row[:userid], new_edit.to_json
+      end
+    end
+
+    @row[:unread] = new_unread_state
+    bool
+  end
+
+  def starred
+    @row[:starred] == 1
+  end
+
+  alias_method :starred?, :starred
+
+  def starred=(bool)
+    old_starred_state = self.starred? ? 1 : 2
+    new_starred_state = bool ? 1 : 2
+    starred_delta = -(new_starred_state - old_starred_state)
+
+    dict = {
+      'entryId' => @row[:oid],
+      'a' => 'starStateMarkerWithDictionary:',
+      'method' => (bool ? 'PUT' : 'DELETE')
+    }
+
+    $rkit_db.transaction do |db|
+      db.execute 'INSERT INTO rkedit (user, json) VALUES (?,?);', @row[:userid], dict.to_json
+    end
+
+    @row[:starred] = new_starred_state
+    bool
+  end
+end
+
+module Tumblr2; end
+
+class Tumblr2::BlogDeleted < StandardError; end
+class Tumblr2::PostDeleted < StandardError; end
+class Tumblr2::PostEditFailure < StandardError; end
+
+class Tumblr2::Blog
+  class << self
+    private :new
+  end
+
+  def self.by_id(blog_id, prefilled_canonical_alias = nil)
+    @by_id_cache ||= {}
+    @by_id_cache[blog_id] ||= new(blog_id, prefilled_canonical_alias)
+  end
+
+
+  def self.owned
+    #blog_ids = self.known_owned_blog_ids
+    #return blog_ids.map{ |blog_id| self.new(blog_id) } unless blog_ids.empty?
+
+    $tumblr_client.info['user']['blogs'].map do |blog|
+      self.by_alias(blog['name'])
+    end
+  end
+
+  def self.known_owned_blog_ids
+    $tumblr_db.execute('SELECT id FROM blogs WHERE owned = 1;').map{ |r| r[0] }
+  end
+
+  def self.canonicalize_alias(noncanonical_alias)
+    noncanonical_alias = noncanonical_alias.encode(Encoding::US_ASCII, invalid: :replace, undef: :replace, replace: '-')
+
+    if noncanonical_alias.index 'http://'
+      noncanonical_alias = URI.parse(noncanonical_alias).hostname
+    end
+
+    unless noncanonical_alias.index '.'
+      noncanonical_alias += '.tumblr.com'
+    end
+
+    noncanonical_alias
+  end
+
+  def self.by_alias(noncanonical_alias)
+    unknown_alias = self.canonicalize_alias(noncanonical_alias)
+
+    blog_id = $tumblr_db.get_first_value 'SELECT blog_id FROM blog_aliases WHERE alias = ?;', unknown_alias
+    return self.by_id(blog_id, unknown_alias) if blog_id
+
+    resp = $tumblr_client.blog_info(unknown_alias)['blog']
+    raise Tumblr2::BlogDeleted, unknown_alias unless resp
+
+    canonical_alias = self.canonicalize_alias(resp['name'])
+    blog_id = $tumblr_db.get_first_value 'SELECT blog_id FROM blog_aliases WHERE alias = ?;', canonical_alias
+
+    if blog_id
+      $tumblr_db.execute 'INSERT OR IGNORE INTO blog_aliases (blog_id, alias) VALUES (?, ?);', blog_id, unknown_alias
+      return self.by_id(blog_id, canonical_alias)
+    end
+
+    $tumblr_db.execute 'INSERT INTO blogs (owned, updated, total_posts) VALUES (?, ?, ?);', (resp['admin'] ? 1 : 0), resp['updated'], resp['total_posts']
+    blog_id = $tumblr_db.last_insert_row_id
+
+    [canonical_alias, self.canonicalize_alias(resp['url'])].uniq.each do |blog_alias|
+      $tumblr_db.execute 'INSERT OR IGNORE INTO blog_aliases (blog_id, alias) VALUES (?, ?);', blog_id, blog_alias
+    end
+
+    self.by_id(blog_id, canonical_alias)
+  end
+
+  def initialize(blog_id, prefilled_canonical_alias = nil)
+    @id = blog_id
+    @canonical_alias = prefilled_canonical_alias
+    @data = nil
+  end
+
+  def data
+    @data ||= $tumblr_db.get_first_row('SELECT * FROM blogs WHERE id = ?;', @id).delete_if{ |k,v| k.class == Fixnum }.map{ |(k,v)| [k.intern, v] }.to_h
+  end
+
+  def aliases
+    @aliases ||= $tumblr_db.execute('SELECT alias FROM blog_aliases WHERE blog_id = ?;', @id).map{ |r| r[0] }.to_set
+  end
+
+  def canonical_alias
+    @canonical_alias ||= self.aliases.find{ |a| a =~ /\.tumblr\.com$/ }
+  end
+
+  def id
+    @id
+  end
+
+  def total_posts
+    self.data[:total_posts]
+  end
+
+  def refresh_data!
+    resp = $tumblr_client.blog_info(self.canonical_alias)['blog']
+    raise Tumblr2::BlogDeleted, self.name unless resp
+
+    $tumblr_db.execute 'UPDATE blogs SET updated = ?, owned = ?, total_posts = ? WHERE id = ?;', resp['updated'], resp['admin'], resp['total_posts'], @id
+
+    old_aliases = self.aliases
+    new_aliases = [resp['name'], resp['url']].map{ |a| self.class.canonicalize_alias(a) }.to_set
+    added_aliases, removed_aliases = (new_aliases - old_aliases), (old_aliases - new_aliases)
+    removed_aliases.each{ |a| $tumblr_db.execute 'DELETE FROM blog_aliases WHERE alias = ?;', a }
+    added_aliases.each{ |a| $tumblr_db.execute 'INSERT INTO blog_aliases (blog_id, alias) VALUES (?, ?);', @id, a }
+
+    @aliases, @canonical_alias, @data = nil, nil, nil
+  end
+
+  def client
+    @client ||= Tumblr2::BlogClientProxy.new(self)
+  end
+
+  def posts
+    Tumblr2::Post.published_by_blog(self)
+  end
+
+  def drafts
+    Tumblr2::Post.drafts_by_blog(self)
+  end
+end
+
+class Tumblr2::BlogClientProxy < BasicObject
+  def initialize(blog)
+    @blog = blog
+  end
+
+  def method_missing(m_name, *args)
+    $tumblr_client.send(m_name, *([@blog.canonical_alias] + args))
+  end
+end
+
+class Tumblr2::Post
+  def self.parse_url(post_url)
+    unless post_url.kind_of?(URI)
+      post_url = post_url.encode(Encoding::US_ASCII, invalid: :replace, undef: :replace, replace: '-')
+      post_url = URI.parse(post_url)
+    end
+    post_url = [post_url.hostname, post_url.path[1..-1].split('/')[1].to_i]
+  end
+
+  HASH_FIELDS = {
+    text: [:title, :body],
+    photo: [:photos, :caption, :width, :height],
+    quote: [:text, :source],
+    link: [:title, :url, :author, :excerpt, :publisher, :photos, :description],
+    chat: [:title, :body, :dialogue],
+    audio: [:caption, :album_art, :artist, :album, :track_name, :track_number, :year],
+    video: [:caption, :player],
+    answer: [:asking_name, :asking_url, :question, :answer]
+  }
+
+  def self.hash_content(resp)
+    resp = resp.map{ |k,v| [k.intern, v] }.to_h
+    fields = HASH_FIELDS[resp[:type].intern].map{ |k| resp[k] }
+    Digest::SHA1.hexdigest(fields.to_json)
+  end
+
+  def self.by_url(post_url)
+    blog_alias, post_id = self.parse_url(post_url)
+    self.by_blog_and_id(Tumblr2::Blog.by_alias(blog_alias), post_id)
+  end
+
+  def self.published_by_blog(blog)
+    # TODO: sync posts from tumblr if called when blog has no posts
+    $tumblr_db.execute('SELECT id FROM posts WHERE blog_id = ? AND is_draft = 0;', blog.id).map{ |r| self.new(r[0], blog) }
+  end
+
+  def self.drafts_by_blog(blog)
+    # TODO: sync posts from tumblr if called when blog has no posts
+    $tumblr_db.execute('SELECT id FROM posts WHERE blog_id = ? AND is_draft = 1;', blog.id).map{ |r| self.new(r[0], blog) }
+  end
+
+  def self.by_blog_and_id(blog, post_id)
+    if $tumblr_db.get_first_value('SELECT COUNT(*) FROM posts WHERE id = ?;', post_id) > 0
+      return self.new(post_id, blog)
+    end
+
+    resp = $tumblr_client.posts(blog.canonical_alias, id: post_id, reblog_info: true)['posts']
+    raise Tumblr2::PostDeleted, blog.canonical_alias unless resp
+    resp = resp.first
+
+    is_draft = (resp['state'] == 'draft')
+    added_comment = (resp['reblog'] and resp['reblog']['comment'].length > 0)
+    content_hash = self.hash_content(resp)
+    tags = resp['tags'].sort.uniq
+
+    $tumblr_db.execute 'INSERT OR IGNORE INTO posts (id, blog_id, created, source_url, reblog_key, is_draft, added_comment, content_hash, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);', post_id, blog.id, resp['timestamp'], resp['reblogged_root_url'], resp['reblog_key'], (is_draft ? 1 : 0), (added_comment ? 1 : 0), content_hash, tags.to_json
+
+    tokens = tags.map{ |t| '#' + t.gsub(/'/, '').gsub(/[^A-Za-z0-9]+/, ' ').strip.tr(' ', '-') }.sort
+    $tumblr_db.execute 'INSERT OR IGNORE INTO post_tokens (post_id, tokens) VALUES (?, ?);', post_id, tokens.join(' ')
+
+    self.new(post_id, blog)
+  end
+
+  def self.search(query_str)
+    $tumblr_db.execute('SELECT post_id FROM post_tokens WHERE tokens MATCH ?;', query_str).map{ |r| self.new(r[0]) }
+  end
+
+  def self.by_blog_and_page(blog, page_number)
+    resp = $tumblr_client.posts(blog.canonical_alias, offset: (page_number * 20), reblog_info: true)['posts']
+    raise Tumblr2::BlogDeleted, blog.canonical_alias unless resp
+
+    $tumblr_db.transaction do |db|
+      resp.each do |resp_post|
+        db.execute 'INSERT OR IGNORE INTO posts (id, blog_id, created, source_url, reblog_key) VALUES (?, ?, ?, ?, ?);', resp_post['id'], blog.id, resp_post['timestamp'], resp_post['reblogged_root_url'], resp_post['reblog_key']
+        db.execute 'INSERT OR IGNORE INTO post_tokens (post_id, tokens) VALUES (?, ?);', resp_post['id'], ""
+
+        is_draft = (resp_post['state'] == 'draft') ? 1 : 0
+        added_comment = (resp_post['reblog'] and resp_post['reblog']['comment'].length > 0) ? 1 : 0
+        content_hash = self.hash_content(resp_post)
+        tags = resp_post['tags'].sort.uniq
+
+        db.execute 'UPDATE posts SET is_draft = ?, added_comment = ?, content_hash = ?, tags = ? WHERE id = ?;', is_draft, added_comment, content_hash, tags.to_json, resp_post['id']
+
+        tokens = tags.map{ |t| '#' + t.gsub(/'/, '').gsub(/[^A-Za-z0-9]+/, ' ').strip.tr(' ', '-') }.sort
+        db.execute 'UPDATE post_tokens SET tokens = ? WHERE post_id = ?;', tokens.join(' '), resp_post['id']
+      end
+    end
+
+    resp.map{ |post| self.new(post['id'], blog) }
+  end
+
+  def initialize(post_id, blog = nil)
+    @id = post_id
+    @blog = blog || Tumblr2::Blog.by_id($tumblr_db.get_first_value('SELECT blog_id FROM posts WHERE id = ?;', post_id))
+    @data = nil
+  end
+
+  attr_reader :id, :blog
+
+  def data
+    @data ||= $tumblr_db.get_first_row('SELECT * FROM posts WHERE id = ?;', @id).delete_if{ |k,v| k.class == Fixnum }.map{ |(k,v)| [k.intern, v] }.to_h
+  end
+
+  def discovered
+    DateTime.parse(self.data[:discovered])
+  end
+
+  def tags
+    ts = self.data[:tags]
+    return Set.new unless ts and ts.length > 0
+    JSON.parse(ts).to_set
+  end
+
+  def source
+    Tumblr2::PostSource.new(self) if self.reblog?
+  end
+
+  def reblog_key
+    self.data[:reblog_key]
+  end
+
+  def reeder_item
+    return nil unless rkitem_id = self.data[:rkitem_id]
+    begin
+      Reeder::Item.new(rkitem_id)
+    rescue
+      nil
+    end
+  end
+
+  def reblog?
+    not(self.data[:source_url].nil?)
+  end
+
+  def added_comment?
+    self.data[:added_comment] == 1
+  end
+
+  def published?
+    self.data[:is_draft] == 0
+  end
+
+  def draft?
+    self.data[:is_draft] == 1
+  end
+
+  # def in_global_timeline?
+  #   ['published', 'private'].include?(self.data[:state])
+  # end
+
+  def url
+    "http://%s/post/%d" % [self.blog.canonical_alias, self.id]
+  end
+
+  def open_url
+    system('open', self.url)
+  end
+
+  def publish!
+    raise ArgumentError, 'not a draft' unless self.draft?
+
+    resp = $tumblr_client.edit(@blog.canonical_alias, id: @id, state: 'published')
+    raise Tumblr2::PostEditFailure, 'cannot publish draft' unless resp.keys == ['id']
+    published_post_id = resp['id']
+
+    $tumblr_db.execute 'DELETE FROM posts WHERE id = ?;', @id
+
+    published_post = self.class.by_blog_and_id(@blog, published_post_id)
+    @id = published_post.id
+    @data = published_post.data
+    self
+  end
+end
+
+
+class Tumblr2::PostSource
+  def initialize(post)
+    @child_post = post
+  end
+
+  RETRIEVAL_STATUSES = {
+    unchecked: 0,
+    retrieved: 1,
+    blog_gone: 2,
+    post_gone: 3
+  }
+
+  RETRIEVAL_STATUS_NAMES = RETRIEVAL_STATUSES.map{ |k,v| [v,k] }.to_h
+
+  def from_post
+    @child_post
+  end
+
+  def retrieval_status
+    RETRIEVAL_STATUS_NAMES[ @child_post.data[:source_status] ]
+  end
+
+  def url
+    source_url = @child_post.data[:source_url].encode(Encoding::US_ASCII, invalid: :replace, undef: :replace, replace: '-')
+    URI.parse(source_url)
+  end
+
+  def tested?
+    self.retrieval_status != :unchecked
+  end
+
+  def available?
+    self.retrieval_status == :retrieved
+  end
+
+  def unavailable?
+    not([:unchecked, :retrieved].include?(self.retrieval_status))
+  end
+
+  def blog_unavailable?
+    self.retrieval_status == :blog_unavailable
+  end
+
+  def blog
+    return @blog if @blog
+    return nil if self.blog_unavailable?
+    begin
+      @blog = Tumblr2::Blog.by_alias(self.url.hostname)
+    rescue Tumblr2::BlogDeleted
+      $tumblr_db.execute('UPDATE posts SET source_status = ? WHERE id = ?;', RETRIEVAL_STATUSES[:blog_gone], @child_post.id)
+      @child_post.data[:source_status] = RETRIEVAL_STATUSES[:blog_gone]
+      nil
+    end
+  end
+
+  def post
+    return @source_post if @source_post
+    return nil if self.unavailable?
+    blog = self.blog
+    return nil unless blog
+
+    begin
+      @source_post = Tumblr2::Post.by_blog_and_id(blog, self.url.path[1..-1].split('/')[1].to_i)
+      $tumblr_db.execute('UPDATE posts SET source_status = ?, source_id = ? WHERE id = ?;', RETRIEVAL_STATUSES[:retrieved], @source_post.id, @child_post.id)
+      @child_post.data[:source_status] = RETRIEVAL_STATUSES[:retrieved]
+      @source_post
+    rescue Tumblr2::PostDeleted
+      $tumblr_db.execute('UPDATE posts SET source_status = ? WHERE id = ?;', RETRIEVAL_STATUSES[:post_gone], @child_post.id)
+      @child_post.data[:source_status] = RETRIEVAL_STATUSES[:post_gone]
+      nil
+    end
+  end
+
+  def test!
+    self.post
+    self.retrieval_status
+  end
+end
+
+def split_workload(total_workload, &work_fn)
+  workers = (ENV['WORKERS'] || '5').to_i
+  workload_size = total_workload.length
+  workload_size_digits = workload_size.to_s.length
+  format_str = "(%.#{workload_size_digits}d/#{workload_size}) %s"
+  pad_str = " " * "(#{workload_size}/#{workload_size}) ".length
+
+  divided_workload = (0...workers).map{ |i| (0 + i).step(total_workload.length - 1, workers).map{ |i| total_workload[i] } }
+
+  io_queue = []
+  io_counter = 0
+  output_thread = Thread.new do
+    Thread.current[:graceful_stop] = false
+    loop do
+      if io_queue.empty?
+        break if Thread.current[:graceful_stop]
+        sleep(0.1)
+      else
+        io = io_queue.shift
+        io.seek(0)
+        lns = io.readlines
+        first_ln, rest_lns = lns.first, lns[1..-1]
+        first_ln = format_str % [(io_counter + 1), first_ln]
+        rest_lns = rest_lns.map{ |ln| pad_str + ln }
+        ([first_ln] + rest_lns).each do |ln|
+          $stderr.write(ln)
+        end
+        $stderr.flush
+        io_counter += 1
+      end
+    end
+  end
+
+  workers = divided_workload.map do |workload|
+    Thread.new do |th|
+      Thread.current[:graceful_stop] = false
+      workload.each do |work_item|
+        break if Thread.current[:graceful_stop]
+        io = StringIO.new
+        begin
+          work_fn.call(work_item, io)
+        rescue => e
+          crash_str = "CRASHED: #{e.inspect}"
+          io.puts "-- #{Paint[crash_str, :red]}"
+          e.backtrace.each do |step|
+            backtrace_ln =
+            io.puts "   #{Paint[step, :red]}"
+          end
+        end
+        io_queue.push(io) unless io.string.empty?
+      end
+    end
+  end
+
+  trap('INT') do
+    workers.each{ |th| th[:graceful_stop] = true }
+    output_thread[:graceful_stop] = true
+  end
+
+  workers.each{ |th| th.join }
+  output_thread[:graceful_stop] = true
+  sleep 0.1 while output_thread.alive?
+
+  true
+end
+
+def test_workload
+  split_workload((0..1000).to_a) do |work_item, io|
+    raise ArgumentError, "woops" if rand(20) == 0
+    io.print "moo... "
+    Kernel.sleep 0.5
+    io.puts "done mooing"
+  end
+end
+
+def sync_owned_blog_pages
+  blogs_pages = Tumblr2::Blog.owned.map do |blog|
+    pages = (0 ... ((blog.total_posts + 19) / 20)).to_a
+    pages.map{ |page_number| {blog: blog, page_number: page_number} }
+  end.flatten
+
+  start_time = DateTime.now
+  all_clean = {}
+
+  split_workload(blogs_pages) do |work_item, io|
+    blog_name = work_item[:blog].canonical_alias
+
+    if all_clean[blog_name]
+      io.puts Paint["#{blog_name}: skipping pg. #{work_item[:page_number] + 1}", :blue]
+      next
+    end
+
+    page = Tumblr2::Post.by_blog_and_page(work_item[:blog], work_item[:page_number])
+    num_discovered = page.find_all{ |post| post.discovered >= start_time }.length
+
+    io.puts "#{blog_name} pg. #{work_item[:page_number] + 1}: discovered #{num_discovered} posts"
+
+    if num_discovered.zero?
+      all_clean[blog_name] = true
+    end
+  end
+
+  true
+end
+
+def sync_drafts
+  blogs_drafts = Tumblr2::Blog.owned.map do |blog|
+    $stderr.puts "#{blog.canonical_alias}: pulling drafts"
+
+    before_id = 0
+    drafts = []
+    loop do
+      $stderr.puts "  #{drafts.length + 1} .. #{drafts.length + 21}, before = #{before_id}"
+      posts_retrieved = $tumblr_client.draft(blog.canonical_alias, before_id: before_id)['posts']
+      break if posts_retrieved.empty?
+      drafts += posts_retrieved
+      before_id = posts_retrieved.last['id']
+    end
+
+    $stderr.puts "#{blog.canonical_alias}: #{drafts.length} drafts on server"
+
+    known_draft_ids = $tumblr_db.execute('SELECT id FROM posts WHERE blog_id = ? AND is_draft = 1;', blog.id).map{ |r| r[0] }.to_set
+    drafts = drafts.find_all{ |draft| not known_draft_ids.include?(draft['id']) }
+
+    drafts.map{ |draft| {blog: blog, draft: draft} }
+  end.flatten
+
+  split_workload(blogs_drafts) do |work_item, io|
+    draft_post = Tumblr2::Post.by_blog_and_id(work_item[:blog], work_item[:draft]['id'])
+    io.puts "retrieved #{draft_post.blog.canonical_alias}/post/#{draft_post.id}"
+
+    if draft_post.reblog? and source = draft_post.source.post
+      io.puts "  source: #{source.blog.canonical_alias}/post/#{source.id}"
+    end
+  end
+
+  true
+end
+
+def clear_drafts
+  $tumblr_db.transaction do |db|
+    draft_sources = db.execute('SELECT source_id FROM posts WHERE is_draft = 1;').map{ |r| r[0] }
+    draft_sources.each do |source_post_id|
+      db.execute 'DELETE FROM posts WHERE id = ?;', source_post_id
+    end
+    db.execute 'DELETE FROM posts WHERE is_draft = 1;'
+  end
+
+  :ok
+end
+
+def sync_owned_blog_reblog_sources
+  blogs_reblog_sources = Tumblr2::Blog.owned.map do |blog|
+    reblog_sources = blog.posts.map{ |post| post.source }.compact.find_all{ |source| not(source.tested?) }
+    reblog_sources.map{ |source| {blog: blog, source: source} }
+  end.flatten
+
+  split_workload(blogs_reblog_sources) do |work_item, io|
+    resolution_desc = case work_item[:source].test!
+    when :retrieved
+      "resolved to #{work_item[:source].blog.canonical_alias}/post/#{work_item[:source].post.id}"
+    when :blog_gone
+      "blog missing"
+    when :post_gone
+      "post has been deleted"
+    end
+
+    io.puts "blog #{work_item[:blog].canonical_alias}, post #{work_item[:source].from_post.id}: #{resolution_desc}"
+  end
+
+  true
+end
+
+def clear_sources
+  $tumblr_db.transaction do |db|
+    db.execute 'DELETE FROM posts WHERE blog_id > 4;'
+    db.execute 'UPDATE posts SET source_status = 0;'
+    db.execute 'UPDATE posts SET source_id = NULL;'
+  end
+
+  :ok
+end
+
+def sync_unread_rss_items
+  $tumblr_db.execute 'INSERT OR IGNORE INTO sets (name) VALUES (?);', "rss-unread"
+  rss_set_id = $tumblr_db.get_first_value 'SELECT id FROM sets WHERE name = ?;', "rss-unread"
+
+  matched_post_ids = $tumblr_db.execute('SELECT post_id FROM sets_posts WHERE set_id = ?;', rss_set_id).map{ |r| r[0] }.to_set
+
+  items = Reeder::User.by_username($config[:reeder][:account]).feeds.map{ |feed| feed.items }.flatten
+  items = items.find_all{ |item| item.unread? and item.tumblr_post? }
+
+  unmatched_items = items.find_all{ |item| not(matched_post_ids.include?(item.tumblr_post_parts[:post_id])) }
+
+  $stderr.puts "Retrieving tumblr posts and sources for #{unmatched_items.length} of #{items.length} unread RSS items:"
+
+  split_workload(unmatched_items) do |item, io|
+    post = item.tumblr_post
+
+    unless post
+      io.puts Paint["deleted -- marking read", :red]
+      item.unread = false
+      next
+    end
+
+    io.puts "post: #{post.blog.canonical_alias}/post/#{post.id}"
+
+    if post.reblog? and source = post.source.post
+      io.puts "  source: #{source.blog.canonical_alias}/post/#{source.id}"
+    end
+
+    $tumblr_db.execute 'UPDATE posts SET rkitem_id = ? WHERE id = ?;', item.id, post.id
+    $tumblr_db.execute 'INSERT OR IGNORE INTO sets_posts (set_id, post_id) VALUES (?, ?);', rss_set_id, post.id
+  end
+end
+
+def sync_starred_rss_items
+  $tumblr_db.execute 'INSERT OR IGNORE INTO sets (name) VALUES (?);', "rss-starred"
+  rss_set_id = $tumblr_db.get_first_value 'SELECT id FROM sets WHERE name = ?;', "rss-starred"
+
+  matched_post_ids = $tumblr_db.execute('SELECT post_id FROM sets_posts WHERE set_id = ?;', rss_set_id).map{ |r| r[0] }.to_set
+
+  starred_rss_items = Reeder::User.by_username($config[:reeder][:account]).starred_items
+  starred_tumblr_items = starred_rss_items.find_all{ |item| item.tumblr_post? }
+  unmatched_starred_tumblr_items = starred_tumblr_items.find_all{ |item| not(matched_post_ids.include?(item.tumblr_post_parts[:post_id])) }
+
+  $stderr.puts "Retrieving tumblr posts and sources for #{unmatched_starred_tumblr_items.length} of #{starred_tumblr_items.length} starred RSS items:"
+
+  split_workload(unmatched_starred_tumblr_items) do |item, io|
+    post = item.tumblr_post
+
+    unless post
+      io.puts Paint["deleted -- unstarring", :red]
+      item.starred = false
+      next
+    end
+
+    io.puts "post: #{post.blog.canonical_alias}/post/#{post.id}"
+
+    if post.reblog? and source = post.source.post
+      io.puts "  source: #{source.blog.canonical_alias}/post/#{source.id}"
+    end
+
+    $tumblr_db.execute 'UPDATE posts SET rkitem_id = ? WHERE id = ?;', item.id, post.id
+    $tumblr_db.execute 'INSERT OR IGNORE INTO sets_posts (set_id, post_id) VALUES (?, ?);', rss_set_id, post.id
+  end
+end
+
+def clear_starred_rss_items
+  starred_set_id = $tumblr_db.get_first_value('SELECT id FROM sets WHERE name = ?;', "rss-starred")
+  return false unless starred_set_id
+
+  $tumblr_db.transaction do |db|
+    starred_posts = db.execute('SELECT post_id FROM sets_posts WHERE set_id = ?;', starred_set_id).map{ |r| r[0] }
+    starred_posts.each do |starred_post_id|
+      source_id = db.get_first_value('SELECT source_id FROM posts WHERE id = ?;', starred_post_id)
+      [starred_post_id, source_id].compact.each do |post_id|
+        db.execute('DELETE FROM posts WHERE id = ?;', post_id)
+      end
+    end
+    db.execute('DELETE FROM sets_posts WHERE set_id = ?;', starred_set_id)
+  end
+end
+
+def push_starred_rss_items_to_drafts
+  reblog_blog = Tumblr2::Blog.by_alias($config[:tumblr][:reblog_blog])
+
+#  starred_posts = if ENV['USE_CACHE']
+    starred_set_id = $tumblr_db.get_first_value('SELECT id FROM sets WHERE name = ?;', "rss-starred")
+    return false unless starred_set_id
+    starred_posts = $tumblr_db.execute('SELECT post_id FROM sets_posts WHERE set_id = ?;', starred_set_id).map{ |r| r[0] }
+#  else
+#    starred_rss_items = Reeder::User.by_username($config[:reeder][:account]).starred_items
+#    starred_rss_items.find_all{ |item| item.tumblr_post? }
+#  end
+
+  split_workload(starred_posts) do |work_item, io|
+    starred_post, rss_item = case work_item
+    when Numeric
+      post = Tumblr2::Post.new(work_item)
+      item = post.reeder_item
+      unless item
+        io.puts "No RSS item for #{work_item}"
+        next
+      end
+      [post, item]
+    when Reeder::Item
+      post = work_item.tumblr_post
+      next unless post
+      [post, work_item]
+    end
+
+    starred_post_conflict_tests = [starred_post]
+    starred_post_conflict_tests += [starred_post.source.post] if starred_post.reblog?
+    starred_post_conflict_tests = starred_post_conflict_tests.compact.map{ |post| post.id }
+    has_conflicting_draft = starred_post_conflict_tests.any?{ |source_id| $tumblr_db.get_first_value('SELECT id FROM posts WHERE source_id = ? AND is_draft = 1;', source_id) }
+
+    if has_conflicting_draft
+      io.puts Paint["conflict with existing post", :red]
+      next
+    end
+
+    resp = $tumblr_client.reblog(reblog_blog.canonical_alias, id: starred_post.id, reblog_key: starred_post.reblog_key, state: 'draft')
+    if resp.keys == ['id']
+      reblog_draft = Tumblr2::Post.by_blog_and_id(reblog_blog, resp['id'])
+      $tumblr_db.execute('DELETE FROM sets_posts WHERE post_id = ?;', starred_post.id)
+      rss_item.starred = false
+      $tumblr_db.execute('UPDATE posts SET rkitem_id = NULL WHERE id = ?;', starred_post.id)
+      io.puts "pushed to #{reblog_draft.blog.canonical_alias}/post/#{reblog_draft.id} and unstarred"
+    else
+      io.puts Paint["failed to push draft", :red]
+    end
+  end
+end
+
+def deduplicate_rss_items
+  unread_rss_items = Reeder::User.new(2).feeds.map{ |f| f.items }.flatten.find_all{ |i| i.unread? and i.tumblr_post? }.map{ |i| i.tumblr_post_parts[:post_id] }.to_set
+
+  threads_by_source = $tumblr_db.execute('SELECT source_id, id FROM posts WHERE source_id IN (SELECT source_id FROM posts GROUP BY source_id HAVING COUNT(id) > 1);').group_by{ |r| r['source_id'] }.map{ |k,vs| ([k] | vs.map{ |r| r['id'] }) }
+
+  threads_by_hash = $tumblr_db.execute('SELECT content_hash, id FROM posts WHERE content_hash IN (SELECT content_hash FROM posts GROUP BY content_hash HAVING COUNT(id) > 1);').group_by{ |r| r['content_hash'] }.map{ |k,vs| vs.map{ |r| r['id'] } }
+
+  threads = Set.new
+  threads_by_post = {}
+
+  (threads_by_source + threads_by_hash).map{ |th| th.to_set }.each do |th|
+    if common_post_id = th.find{ |pid| threads_by_post.has_key?(pid) }
+      threads_by_post[common_post_id] |= th
+    else
+      threads.add(th)
+      th.each{ |pid| threads_by_post[pid] = th }
+    end
+  end
+
+  threads = threads.map{ |th| th.find_all{ |v| unread_rss_items.include?(v) } }.find_all{ |th| th.length > 1 }
+  threads = threads.map{ |th| th.map{ |post_id| Tumblr2::Post.new(post_id) }.sort_by{ |post| post.data[:created] } }
+  threads = threads.map{ |th| th[0..-2].map{ |post| post.reeder_item } }
+
+  threads.each{ |th| th.each{ |item| item.unread = false } }
+
+  threads.map{ |th| th.length }.inject(0, &:+)
+end
+
+def init
+  $stderr.puts "Discovered blogs:"
+  Tumblr2::Blog.owned.each do |blog|
+    $stderr.puts "  #{blog.canonical_alias}"
+  end
+
+  nil
+end
+
+def publish_random_draft
+  a_draft = Tumblr2::Blog.by_alias($config[:tumblr][:reblog_blog]).drafts.shuffle.first
+  begin
+    a_draft.publish!
+    $stdout.puts(a_draft.url)
+  rescue Tumblr2::PostEditFailure
+    $stderr.puts Paint["Could not publish post", :red]
+    Kernel.exit 1
+  end
+end
+
+def sync
+  sync_owned_blog_pages
+  sync_owned_blog_reblog_sources
+  sync_unread_rss_items
+  clear_starred_rss_items
+  sync_starred_rss_items
+  push_starred_rss_items_to_drafts
+  purge_trash
+end
+
+def purge_invalidated
+  $rkit_db.execute('DELETE FROM rkitem WHERE id IN (SELECT rkitem.id FROM rkitem LEFT OUTER JOIN rkitemdata ON rkitem.id = rkitemdata.item WHERE rkitemdata.id IS NULL);')
+  true
+end
+
+def sql(stmt, *args)
+  $tumblr_db.execute(stmt, *args)
+end
+
+def compile_trash_filter(f)
+  q = []
+  q.push "post.blog.aliases.include?(#{f[:blog].inspect})"
+  q.push "post.tags.map(&:downcase).include?(#{f[:tag].downcase.inspect})" if f[:tag]
+  q.push "item.type == #{f[:type].inspect}" if f[:type]
+  q.push "item.type != #{f[:type].inspect}" if f[:nottype]
+  q.push "post.reblog?" if f[:reblog] == true
+  q.push "not post.reblog?" if f[:reblog] == false
+
+  code = "lambda{ |item, post| #{q.map{ |a| "(#{a})" }.join(' and ')} }"
+
+  Kernel.eval(code)
+end
+
+def purge_trash
+  items = Reeder::User.by_username($config[:reeder][:account]).feeds.map{ |feed| feed.items }.flatten
+  items = items.find_all{ |item| item.unread? and item.tumblr_post? }
+
+  filters = $config[:trash_filters].map{ |f| compile_trash_filter(f) }
+
+  trash = items.find_all do |item|
+    next unless post = item.tumblr_post
+    filters.any?{ |f| f.call(item, post) }
+  end
+
+  $stderr.puts "Marking #{trash.length} of #{items.length} posts as read:"
+
+  split_workload(trash) do |work_item, io|
+    work_item.unread = false
+    io.puts "marked as read: #{work_item.source_uri}"
+  end
+
+  true
+end
+
+if __FILE__ == $0
+  if ARGV[0]
+    cmd = ARGV.shift.tr('-', '_').intern
+    result = self.send(cmd, *ARGV)
+    pp(result) unless result.nil?
+  else
+    require 'pry'
+    pry
+  end
+end
