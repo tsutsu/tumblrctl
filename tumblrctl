@@ -658,6 +658,8 @@ class Tumblr2::PostSource
 end
 
 def split_workload(total_workload, &work_fn)
+  return true if total_workload.length == 0
+
   workers = (ENV['WORKERS'] || '5').to_i
   workload_size = total_workload.length
   workload_size_digits = workload_size.to_s.length
